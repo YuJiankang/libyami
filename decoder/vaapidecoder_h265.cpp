@@ -27,12 +27,17 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
-#include <tr1/functional>
 #include "common/log.h"
 #include "vaapidecoder_h265.h"
 #include "vaapidecoder_factory.h"
 
 namespace YamiMediaCodec{
+
+using std::tr1::bind;
+using std::tr1::placeholders::_1;
+using std::tr1::ref;
+
+typedef VaapiDecoderH265::PicturePtr PicturePtr;
 
 typedef enum {
     VAAPI_DECODER_UNIT_FLAG_FRAME_START = (1 << 0),
@@ -95,22 +100,13 @@ enum
       VAAPI_PICTURE_FLAGS_REFERENCE) ==                     \
      VAAPI_PICTURE_FLAG_LONG_TERM_REFERENCE)
 
-#define G_N_ELEMENTS(arr)		(sizeof (arr) / sizeof ((arr)[0]))
-
 #define RSV_VCL_N10 10
 #define RSV_VCL_N12 12
 #define RSV_VCL_N14 14
-VaapiH265FrameStore::VaapiH265FrameStore(PicturePtr& pic)
-{
-    buffer = pic;
-}
-
-VaapiH265FrameStore::~VaapiH265FrameStore()
-{
-}
 
 VaapiDecoderH265::VaapiDecoderH265()
-    :m_nalLengthSize(4), m_newBitstream(true)
+    :m_nalLengthSize(4), m_newBitstream(true),
+    m_dpb(bind(&VaapiDecoderH265::outputPicture, this, _1), m_spsMaxLatencyPictures)
 {
     memset(&this->m_zeroInitStart, 0,
            &this->m_zeroInitEnd - &this->m_zeroInitStart);
@@ -146,11 +142,11 @@ void VaapiDecoderH265::flush(void)
 {
     if (m_currentPicture) {
         m_currentPicture->decode();
-        dpb_add (m_currentPicture,  &m_slice_hdr, NULL);
+        m_dpb.add (m_currentPicture,  &m_slice_hdr, NULL);
         m_currentPicture.reset();
     }
 
-    dpb_flush();
+    m_dpb.flush();
 }
 
 Decode_Status VaapiDecoderH265::ensureContext()
@@ -348,14 +344,14 @@ bool VaapiDecoderH265::fillPredWeightTable(VASliceParameterBufferHEVC*sliceParam
     return true;
 }
 
-void VaapiDecoderH265::vaapi_init_picture (VAPictureHEVC * pic)
+void vaapi_init_picture (VAPictureHEVC * pic)
 {
     pic->pic_order_cnt = 0;
     pic->picture_id = VA_INVALID_SURFACE;
     pic->flags = VA_PICTURE_HEVC_INVALID;
 }
 
-void VaapiDecoderH265::vaapi_fill_picture (VAPictureHEVC * pic, VaapiDecPictureH265 * picture,
+void vaapi_fill_picture (VAPictureHEVC * pic, VaapiDecPictureH265 * picture,
     uint32_t pictureStructure)
 {
 
@@ -484,6 +480,17 @@ bool VaapiDecoderH265::fillSlice(VaapiDecPictureH265 * picture, VASliceParameter
     return true;
 }
 
+void fillReference(VAPictureParameterBufferHEVC* picParam, uint32_t& n, const PicturePtr& picture)
+{
+    if (n >= N_ELEMENTS(picParam->ReferenceFrames)) {
+        ERROR("reference frame should not large than %d", N_ELEMENTS(picParam->ReferenceFrames));
+        return;
+    }
+    if (VAAPI_PICTURE_IS_REFERENCE(picture)) {
+        vaapi_fill_picture (&picParam->ReferenceFrames[n++], picture.get(),
+            picture->m_structure);
+    }
+}
 bool VaapiDecoderH265::fillPicture(PicturePtr& picture, H265NalUnit * nalu)
 {
     uint32_t i, n;
@@ -504,19 +511,9 @@ bool VaapiDecoderH265::fillPicture(PicturePtr& picture, H265NalUnit * nalu)
     vaapi_fill_picture (&pic_param->CurrPic, picture.get(), 0);
 
     /* Fill in ReferenceFrames */
-    for (i = 0, n = 0; i < m_dpb_count; i++) {
-
-        VaapiH265FrameStore::Ptr& fs = m_dpb[i];
-        if ((fs && vaapi_frame_store_has_reference (fs))) {
-            vaapi_fill_picture (&pic_param->ReferenceFrames[n++], fs->buffer.get(),
-            fs->buffer->m_structure);
-        }
-
-        if (n >= G_N_ELEMENTS (pic_param->ReferenceFrames))
-            break;
-    }
-
-    for (; n < G_N_ELEMENTS (pic_param->ReferenceFrames); n++)
+    n = 0;
+    m_dpb.forEach(bind(fillReference, pic_param, ref(n), _1));
+    for (; n < N_ELEMENTS (pic_param->ReferenceFrames); n++)
         vaapi_init_picture (&pic_param->ReferenceFrames[n]);
 
     #define COPY_FIELD(s, f) \
@@ -807,11 +804,9 @@ Decode_Status VaapiDecoderH265::ensure_dpb (H265SPS * sps)
 {
     uint32_t dpb_size;
     dpb_size = get_max_dec_frame_buffering (sps);
-    if (m_dpb_size < dpb_size) {
-    }
 
     /* Reset DPB */
-    if (!dpb_reset (dpb_size))
+    if (!m_dpb.reset (dpb_size))
         return DECODE_FAIL;
 
     return DECODE_SUCCESS;
@@ -876,264 +871,16 @@ void VaapiDecoderH265::init_picture_poc (PicturePtr& picture, H265SliceHdr *slic
     }
 }
 
-void VaapiDecoderH265::vaapi_picture_h265_set_reference(VaapiDecPictureH265* picture, uint32_t referenceFlags)
+void vaapi_picture_h265_set_reference(VaapiDecPictureH265* picture, uint32_t referenceFlags)
 {
     VAAPI_PICTURE_FLAG_UNSET(picture, VAAPI_PICTURE_FLAGS_RPS_ST | VAAPI_PICTURE_FLAGS_RPS_LT);
     VAAPI_PICTURE_FLAG_UNSET(picture, VAAPI_PICTURE_FLAGS_REFERENCE);
     VAAPI_PICTURE_FLAG_SET(picture, referenceFlags);
 }
 
-
-/* Get the dpb picture having the specifed poc or poc_lsb */
-VaapiDecPictureH265 *VaapiDecoderH265::dpb_get_picture (int32_t poc, bool match_lsb)
+void setReference(const PicturePtr& picture, uint32_t referenceFlags)
 {
-    uint32_t i;
-
-    for (i = 0; i < m_dpb_count; i++) {
-    VaapiDecPictureH265 *picture = m_dpb[i]->buffer.get();
-
-    if (picture && VAAPI_PICTURE_FLAG_IS_SET (picture,
-            VAAPI_PICTURE_FLAGS_REFERENCE)) {
-        if (match_lsb) {
-            if (picture->m_poc_lsb == poc)
-                return picture;
-            } else {
-                if (picture->m_poc == poc)
-                    return picture;
-            }
-        }
-    }
-    return NULL;
-}
-
-/* Get the dpb picture having the specifed poc and shor/long ref flags */
-VaapiDecPictureH265 *VaapiDecoderH265::dpb_get_ref_picture (int32_t poc, bool is_short)
-{
-    uint32_t i;
-
-    for (i = 0; i < m_dpb_count; i++) {
-        VaapiDecPictureH265 *picture = m_dpb[i]->buffer.get();
-
-        if (picture && picture->m_poc == poc) {
-            if (is_short && VAAPI_PICTURE_IS_SHORT_TERM_REFERENCE (picture))
-                return picture;
-            else if (VAAPI_PICTURE_IS_LONG_TERM_REFERENCE (picture))
-                return picture;
-        }
-    }
-    return NULL;
-}
-
-void VaapiDecoderH265::dpb_remove_index(uint32_t index)
-{
-    uint32_t i, num_frames = --m_dpb_count;
-    if (index != num_frames)
-        m_dpb[index] = m_dpb[num_frames];
-}
-
-/* Finds the picture with the lowest POC that needs to be output */
-int32_t VaapiDecoderH265::dpb_find_lowest_poc (VaapiDecPictureH265 ** found_picture_ptr)
-{
-    VaapiDecPictureH265 *found_picture = NULL;
-    uint32_t i, found_index;
-
-    for (i = 0; i < m_dpb_count; i++) {
-        VaapiDecPictureH265 *picture = m_dpb[i]->buffer.get();
-        if (picture && !picture->m_output_needed)
-            continue;
-        if (!found_picture || found_picture->m_poc > picture->m_poc)
-            found_picture = picture, found_index = i;
-    }
-
-    if (found_picture_ptr)
-        *found_picture_ptr = found_picture;
-    return found_picture ? found_index : -1;
-}
-
-bool VaapiDecoderH265::vaapi_frame_store_has_reference (VaapiH265FrameStore::Ptr fs)
-{
-    if (VAAPI_PICTURE_IS_REFERENCE (fs->buffer))
-        return true;
-    return false;
-}
-
-bool VaapiDecoderH265::dpb_output(VaapiH265FrameStore::Ptr &frameStore)
-{
-    PicturePtr frame;
-    if (frameStore) {
-        frame = frameStore->buffer;
-    }
-    frame->m_output_needed = false;
-
-    DEBUG("DPB: output picture(Addr:%p, Poc:%d)", frame.get(), frame->m_POC);
-    return outputPicture(frame) == DECODE_SUCCESS;
-}
-
-bool VaapiDecoderH265::dpb_bump (VaapiDecPictureH265 * picture)
-{
-    VaapiDecPictureH265 *found_picture;
-    int32_t found_index;
-    bool success;
-    found_index = dpb_find_lowest_poc (&found_picture);
-    if (found_index < 0)
-        return false;
-    success = dpb_output(m_dpb[found_index]);
-    if (!vaapi_frame_store_has_reference (m_dpb[found_index]))
-        dpb_remove_index (found_index);
-
-    return success;
-}
-
-void VaapiDecoderH265::dpb_clear (bool hard_flush)
-{
-    PicturePtr pic;
-    uint32_t i;
-
-    if (hard_flush) {
-        for (i = 0; i < m_dpb_count; i++) {
-            dpb_remove_index (i);
-        }
-        m_dpb_count = 0;
-    } else {
-        /* Remove unused pictures from DPB */
-        i = 0;
-        while (i < m_dpb_count) {
-            VaapiH265FrameStore::Ptr fs = m_dpb[i];
-            pic = fs->buffer;
-            if (!pic->m_output_needed && !vaapi_frame_store_has_reference (fs))
-                dpb_remove_index (i);
-            else
-                i++;
-        }
-    }
-}
-
-void VaapiDecoderH265::dpb_flush ()
-{
-    /* Output any frame remaining in DPB */
-    while (dpb_bump (NULL));
-    dpb_clear (true);
-}
-
-int32_t VaapiDecoderH265::dpb_get_num_need_output ()
-{
-    uint32_t i = 0, n_output_needed = 0;
-
-    while (i < m_dpb_count) {
-        VaapiH265FrameStore::Ptr fs = m_dpb[i];
-        if (fs->buffer->m_output_needed)
-            n_output_needed++;
-        i++;
-    }
-    return n_output_needed;
-}
-
-bool VaapiDecoderH265::check_latency_cnt ()
-{
-    PicturePtr tmp_pic;
-    uint32_t i = 0;
-
-    while (i < m_dpb_count) {
-        VaapiH265FrameStore::Ptr fs = m_dpb[i];
-        tmp_pic = fs->buffer;
-        if (tmp_pic->m_output_needed) {
-            if (tmp_pic->m_pic_latency_cnt >= m_SpsMaxLatencyPictures)
-                return true;
-        }
-        i++;
-    }
-
-    return false;
-}
-
-bool VaapiDecoderH265::dpb_add (PicturePtr& pic, H265SliceHdr *slice_hdr, H265NalUnit * nalu)
-{
-
-    H265PPS *const pps = slice_hdr->pps;
-    H265SPS *const sps = pps->sps;
-    VaapiDecPictureH265 *picture = pic.get();
-    VaapiH265FrameStore::Ptr fs;
-
-    PicturePtr tmp_pic;
-    uint32_t i = 0;
-    /* C.5.2.3 */
-    while (i < m_dpb_count) {
-        VaapiH265FrameStore::Ptr fs = m_dpb[i];
-        tmp_pic = fs->buffer;
-        if (tmp_pic->m_output_needed)
-            tmp_pic->m_pic_latency_cnt += 1;
-        i++;
-    }
-
-    if (picture->m_output_flag) {
-        picture->m_output_needed = 1;
-        picture->m_pic_latency_cnt = 0;
-    } else{
-        picture->m_output_needed = 0;
-    }
-
-    /* set pic as short_term_ref */
-    vaapi_picture_h265_set_reference (picture,
-             VAAPI_PICTURE_FLAG_SHORT_TERM_REFERENCE);
-
-    /* C.5.2.4 "Bumping" process */
-    while ((dpb_get_num_need_output () >
-        sps->max_num_reorder_pics[sps->max_sub_layers_minus1])
-        || (sps->max_latency_increase_plus1[sps->max_sub_layers_minus1]
-        && check_latency_cnt ()))
-        dpb_bump (picture);
-
-    /* Create new frame store */
-    fs.reset(new VaapiH265FrameStore(pic));
-
-    m_dpb[m_dpb_count++] = fs;
-    return true;
-}
-
-/* C.5.2.2 */
-bool VaapiDecoderH265::dpb_init (VaapiDecPictureH265 * picture, H265SliceHdr *slice_hdr,  H265NalUnit * nalu)
-{
-    H265PPS *const pps = slice_hdr->pps;
-    H265SPS *const sps = pps->sps;
-
-    if (nal_is_irap (nalu->type)
-      && picture->m_NoRaslOutputFlag && !m_newBitstream) {
-        if (nalu->type == H265_NAL_SLICE_CRA_NUT)
-            picture->m_NoOutputOfPriorPicsFlag = 1;
-        else
-            picture->m_NoOutputOfPriorPicsFlag =
-            slice_hdr->no_output_of_prior_pics_flag;
-
-        if (picture->m_NoOutputOfPriorPicsFlag)
-            dpb_clear (true);
-        else {
-            dpb_clear (false);
-            while (dpb_bump (NULL));
-        }
-    } else {
-        dpb_clear (false);
-        while ((dpb_get_num_need_output () >
-            sps->max_num_reorder_pics[sps->max_sub_layers_minus1])
-            || (sps->max_latency_increase_plus1[sps->max_sub_layers_minus1]
-            && check_latency_cnt ())
-            || (m_dpb_count >=
-            (sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1] +
-            1))) {
-            dpb_bump (picture);
-        }
-    }
-
-    return true;
-}
-
-Decode_Status VaapiDecoderH265::dpb_reset (uint32_t dpb_size)
-{
-    if (dpb_size > m_dpb_size) {
-        memset (&m_dpb[m_dpb_size], 0,
-        (dpb_size - m_dpb_size) * sizeof (m_dpb[0]));
-        m_dpb_size = dpb_size;
-    }
-    return true;
+    vaapi_picture_h265_set_reference(picture.get(), referenceFlags);
 }
 
 /* Detection of the first VCL NAL unit of a coded picture (7.4.2.4.5 ) */
@@ -1145,12 +892,12 @@ bool VaapiDecoderH265::is_new_picture (H265SliceHdr *slice_hdr)
     return false;
 }
 
-bool VaapiDecoderH265::has_entry_in_rps (VaapiDecPictureH265 * dpb_pic,
+bool has_entry_in_rps (const PicturePtr& dpb_pic,
     VaapiDecPictureH265 ** rps_list, uint32_t rps_list_length)
 {
     uint32_t i;
 
-    if (!dpb_pic || !rps_list || !rps_list_length)
+    if (!rps_list || !rps_list_length)
         return false;
 
     for (i = 0; i < rps_list_length; i++) {
@@ -1158,6 +905,16 @@ bool VaapiDecoderH265::has_entry_in_rps (VaapiDecPictureH265 * dpb_pic,
             return true;
     }
     return false;
+}
+
+void VaapiDecoderH265::markUnusedReference(const PicturePtr& picture)
+{
+    if (!has_entry_in_rps (picture, m_RefPicSetLtCurr, m_NumPocLtCurr)
+        && !has_entry_in_rps (picture, m_RefPicSetLtFoll,m_NumPocLtFoll)
+        && !has_entry_in_rps (picture, m_RefPicSetStCurrAfter, m_NumPocStCurrAfter)
+        && !has_entry_in_rps (picture, m_RefPicSetStCurrBefore, m_NumPocStCurrBefore)
+        && !has_entry_in_rps (picture, m_RefPicSetStFoll, m_NumPocStFoll))
+        setReference(picture, 0);
 }
 
 /* the derivation process for the RPS and the picture marking */
@@ -1175,13 +932,13 @@ void VaapiDecoderH265::derive_and_mark_rps (VaapiDecPictureH265 * picture, int32
     /* (8-6) */
     for (i = 0; i < m_NumPocLtCurr; i++) {
         if (!CurrDeltaPocMsbPresentFlag[i]) {
-            dpb_pic = dpb_get_picture (m_PocLtCurr[i], true);
+            dpb_pic = m_dpb.getPicture (m_PocLtCurr[i], true);
             if (dpb_pic)
                 m_RefPicSetLtCurr[i] = dpb_pic;
             else
                 m_RefPicSetLtCurr[i] = NULL;
         } else {
-            dpb_pic = dpb_get_picture (m_PocLtCurr[i], false);
+            dpb_pic = m_dpb.getPicture (m_PocLtCurr[i], false);
             if (dpb_pic)
                 m_RefPicSetLtCurr[i] = dpb_pic;
             else
@@ -1193,13 +950,13 @@ void VaapiDecoderH265::derive_and_mark_rps (VaapiDecPictureH265 * picture, int32
 
     for (i = 0; i < m_NumPocLtFoll; i++) {
     if (!FollDeltaPocMsbPresentFlag[i]) {
-        dpb_pic = dpb_get_picture (m_PocLtFoll[i], true);
+        dpb_pic = m_dpb.getPicture (m_PocLtFoll[i], true);
         if (dpb_pic)
             m_RefPicSetLtFoll[i] = dpb_pic;
         else
             m_RefPicSetLtFoll[i] = NULL;
         } else {
-            dpb_pic = dpb_get_picture (m_PocLtFoll[i], false);
+            dpb_pic = m_dpb.getPicture (m_PocLtFoll[i], false);
             if (dpb_pic)
                 m_RefPicSetLtFoll[i] = dpb_pic;
             else
@@ -1225,7 +982,7 @@ void VaapiDecoderH265::derive_and_mark_rps (VaapiDecPictureH265 * picture, int32
 
     /* (8-7) */
     for (i = 0; i < m_NumPocStCurrBefore; i++) {
-        dpb_pic = dpb_get_ref_picture (m_PocStCurrBefore[i], true);
+        dpb_pic = m_dpb.getRefPicture (m_PocStCurrBefore[i], true);
         if (dpb_pic) {
             vaapi_picture_h265_set_reference (dpb_pic,
                           VAAPI_PICTURE_FLAG_SHORT_TERM_REFERENCE |
@@ -1238,7 +995,7 @@ void VaapiDecoderH265::derive_and_mark_rps (VaapiDecPictureH265 * picture, int32
         m_RefPicSetStCurrBefore[i] = NULL;
 
     for (i = 0; i < m_NumPocStCurrAfter; i++) {
-        dpb_pic = dpb_get_ref_picture (m_PocStCurrAfter[i], true);
+        dpb_pic = m_dpb.getRefPicture (m_PocStCurrAfter[i], true);
         if (dpb_pic) {
           vaapi_picture_h265_set_reference (dpb_pic,
                         VAAPI_PICTURE_FLAG_SHORT_TERM_REFERENCE |
@@ -1251,7 +1008,7 @@ void VaapiDecoderH265::derive_and_mark_rps (VaapiDecPictureH265 * picture, int32
         m_RefPicSetStCurrAfter[i] = NULL;
 
     for (i = 0; i < m_NumPocStFoll; i++) {
-        dpb_pic = dpb_get_ref_picture (m_PocStFoll[i], true);
+        dpb_pic = m_dpb.getRefPicture (m_PocStFoll[i], true);
         if (dpb_pic) {
             vaapi_picture_h265_set_reference (dpb_pic,
                           VAAPI_PICTURE_FLAG_SHORT_TERM_REFERENCE |
@@ -1264,21 +1021,7 @@ void VaapiDecoderH265::derive_and_mark_rps (VaapiDecPictureH265 * picture, int32
         m_RefPicSetStFoll[i] = NULL;
 
     /* Mark all dpb pics not beloging to RefPicSet*[] as unused for ref */
-    for (i = 0; i < m_dpb_count; i++) {
-        dpb_pic = m_dpb[i]->buffer.get();
-        if (dpb_pic &&
-            !has_entry_in_rps (dpb_pic, m_RefPicSetLtCurr, m_NumPocLtCurr)
-            && !has_entry_in_rps (dpb_pic, m_RefPicSetLtFoll,
-            m_NumPocLtFoll)
-            && !has_entry_in_rps (dpb_pic, m_RefPicSetStCurrAfter,
-            m_NumPocStCurrAfter)
-            && !has_entry_in_rps (dpb_pic, m_RefPicSetStCurrBefore,
-            m_NumPocStCurrBefore)
-            && !has_entry_in_rps (dpb_pic, m_RefPicSetStFoll,
-            m_NumPocStFoll))
-            vaapi_picture_h265_set_reference (dpb_pic, 0);
-    }
-
+    m_dpb.forEach(bind(&VaapiDecoderH265::markUnusedReference, this, _1));
 }
 
 /* Decoding process for reference picture set (8.3.2) */
@@ -1295,13 +1038,7 @@ bool VaapiDecoderH265::decode_ref_pic_set (PicturePtr& picture, H265SliceHdr *sl
 
     /* if it is an irap pic, set all ref pics in dpb as unused for ref */
     if (nal_is_irap (nalu->type) && picture->m_NoRaslOutputFlag) {
-
-        for (i = 0; i < m_dpb_count; i++) {
-            VaapiH265FrameStore::Ptr fs = m_dpb[i];
-            if (fs) {
-                vaapi_picture_h265_set_reference (fs->buffer.get(), 0);
-            }
-        }
+        m_dpb.forEach(bind(setReference, _1, 0));
     }
 
     /* Reset everything for IDR */
@@ -1688,7 +1425,7 @@ Decode_Status VaapiDecoderH265::decodeSlice(H265NalUnit * nalu)
     if (is_new_picture (sliceHdr)) {
         if (m_currentPicture) {
             m_currentPicture->decode();
-            dpb_add (m_currentPicture,  sliceHdr, nalu);
+            m_dpb.add (m_currentPicture,  sliceHdr, nalu);
             m_currentPicture.reset();
         }
 
@@ -1711,7 +1448,7 @@ Decode_Status VaapiDecoderH265::decodeSlice(H265NalUnit * nalu)
         if (!decode_ref_pic_set (picture, sliceHdr, nalu))
             return DECODE_FAIL;
 
-        if (!dpb_init (picture.get(), sliceHdr, nalu))
+        if (!m_dpb.init(picture.get(), sliceHdr, nalu, m_newBitstream))
             return DECODE_FAIL;
 
         if (!fillPicture(picture, nalu)) {
@@ -1772,6 +1509,219 @@ Decode_Status VaapiDecoderH265::decodePPS(H265NalUnit * nalu)
 Decode_Status VaapiDecoderH265::decodeSEI(H265NalUnit * nalu)
 {
     return DECODE_SUCCESS;
+}
+
+Decode_Status VaapiDecoderH265::outputPicture(const PicturePtr& picture)
+{
+    VaapiDecoderBase::PicturePtr base = std::tr1::static_pointer_cast<VaapiDecPicture>(picture);
+    return VaapiDecoderBase::outputPicture(base);
+}
+
+VaapiDecoderH265::DPB::DPB(OutputCallback output, uint32_t& spsMaxLatencyPictures)
+    :m_output(output), m_spsMaxLatencyPictures(spsMaxLatencyPictures),
+     m_dummy(new VaapiDecPictureH265)
+{
+}
+
+inline bool isReferencePicture(const PicturePtr& pic)
+{
+    return VAAPI_PICTURE_IS_REFERENCE(pic);
+}
+
+inline bool isOutputNeeded(const PicturePtr& pic)
+{
+    return pic->m_output_needed;
+}
+
+inline bool isUnusedPicture(const PicturePtr& pic)
+{
+    return !isOutputNeeded(pic) && !isReferencePicture(pic);
+}
+
+/* C.5.2.2 */
+bool VaapiDecoderH265::DPB::init(VaapiDecPictureH265 * picture,
+     H265SliceHdr *slice_hdr,  H265NalUnit * nalu, bool newBitstream)
+{
+    H265PPS *const pps = slice_hdr->pps;
+    H265SPS *const sps = pps->sps;
+
+    if (nal_is_irap (nalu->type)
+        && picture->m_NoRaslOutputFlag && !newBitstream) {
+        if (nalu->type == H265_NAL_SLICE_CRA_NUT)
+            picture->m_NoOutputOfPriorPicsFlag = 1;
+        else
+            picture->m_NoOutputOfPriorPicsFlag =
+            slice_hdr->no_output_of_prior_pics_flag;
+
+        if (picture->m_NoOutputOfPriorPicsFlag)
+            clear (true);
+        else {
+            clear (false);
+            while (bump ());
+        }
+    } else {
+        clear (false);
+        while ((getNumNeedOutput() >
+            sps->max_num_reorder_pics[sps->max_sub_layers_minus1])
+            || (sps->max_latency_increase_plus1[sps->max_sub_layers_minus1]
+            && checkLatencyCnt ())
+            || (m_pictures.size() >=
+            (sps->max_dec_pic_buffering_minus1[sps->max_sub_layers_minus1] +
+            1))) {
+            bump();
+        }
+    }
+
+    return true;
+}
+
+void addLatency(const PicturePtr& pic)
+{
+    if (pic->m_output_needed)
+        pic->m_pic_latency_cnt++;
+}
+
+
+bool VaapiDecoderH265::DPB::add (PicturePtr& picture, H265SliceHdr *slice_hdr, H265NalUnit * nalu)
+{
+
+    H265PPS *const pps = slice_hdr->pps;
+    H265SPS *const sps = pps->sps;
+
+    PicturePtr tmp_pic;
+    uint32_t i = 0;
+    /* C.5.2.3 */
+    forEach(addLatency);
+
+    if (picture->m_output_flag) {
+        picture->m_output_needed = 1;
+        picture->m_pic_latency_cnt = 0;
+    } else{
+        picture->m_output_needed = 0;
+    }
+
+    /* set pic as short_term_ref */
+    vaapi_picture_h265_set_reference (picture.get(),
+             VAAPI_PICTURE_FLAG_SHORT_TERM_REFERENCE);
+
+    /* C.5.2.4 "Bumping" process */
+    while ((getNumNeedOutput () >
+        sps->max_num_reorder_pics[sps->max_sub_layers_minus1])
+        || (sps->max_latency_increase_plus1[sps->max_sub_layers_minus1]
+        && checkLatencyCnt ()))
+        bump();
+    m_pictures.insert(picture);
+    return true;
+}
+
+void VaapiDecoderH265::DPB::flush()
+{
+    /* Output any frame remaining in DPB */
+    while (bump());
+    clear (true);
+}
+
+void VaapiDecoderH265::DPB::forEach(ForEachFunction fn)
+{
+    std::for_each(m_pictures.begin(), m_pictures.end(), fn);
+}
+
+bool VaapiDecoderH265::DPB::reset(uint32_t dpbSize)
+{
+    //nothing
+    return true;
+}
+
+bool matchPocLsb(int32_t poc, const PicturePtr& picture)
+{
+    return picture->m_poc_lsb == poc;
+}
+
+/* Get the dpb picture having the specifed poc or poc_lsb */
+VaapiDecPictureH265* VaapiDecoderH265::DPB::getPicture (int32_t poc, bool matchLsb)
+{
+    PictureList::iterator it;
+    if (matchLsb) {
+        it = find_if(m_pictures.begin(), m_pictures.end(),
+                     bind(matchPocLsb, poc, _1));
+    } else {
+        m_dummy->m_poc = poc;
+        it = m_pictures.find(m_dummy);
+    }
+    if (it != m_pictures.end()) {
+        const PicturePtr& picture = *it;
+        if (isReferencePicture(picture))
+            return picture.get();
+    }
+    return NULL;
+}
+
+/* Get the dpb picture having the specifed poc and shor/long ref flags */
+VaapiDecPictureH265* VaapiDecoderH265::DPB::getRefPicture(int poc, bool isShort)
+{
+    m_dummy->m_poc = poc;
+    PictureList::iterator it = m_pictures.find(m_dummy);
+    if (it != m_pictures.end()) {
+        const PicturePtr& picture = *it;
+        if ((isShort && VAAPI_PICTURE_IS_SHORT_TERM_REFERENCE (picture))
+            || VAAPI_PICTURE_IS_LONG_TERM_REFERENCE (picture))
+            return picture.get();
+    }
+    return NULL;
+}
+
+void VaapiDecoderH265::DPB::clear(bool hardFlush)
+{
+    PicturePtr pic;
+    uint32_t i;
+
+    if (hardFlush) {
+        m_pictures.clear();
+    } else {
+        /* Remove unused pictures from DPB */
+        PictureList::iterator it =
+            remove_if(m_pictures.begin(), m_pictures.end(), isUnusedPicture);
+        m_pictures.erase(it, m_pictures.end());
+    }
+}
+
+bool VaapiDecoderH265::DPB::bump()
+{
+    PictureList::iterator it =
+        find_if(m_pictures.begin(),m_pictures.end(), isOutputNeeded);
+    if (it == m_pictures.end())
+        return false;
+    bool success = output(*it);
+    if (!VAAPI_PICTURE_IS_REFERENCE(*it))
+        m_pictures.erase(it);
+    return success;
+}
+
+bool VaapiDecoderH265::DPB::output(const PicturePtr& picture)
+{
+    picture->m_output_needed = false;
+
+    DEBUG("DPB: output picture(Addr:%p, Poc:%d)", picture.get(), picture->m_poc);
+    return m_output(picture) == DECODE_SUCCESS;
+}
+
+int32_t VaapiDecoderH265::DPB::getNumNeedOutput()
+{
+    return count_if(m_pictures.begin(), m_pictures.end(), isOutputNeeded);
+}
+
+bool checkPictureLatencyCnt(uint32_t spsMaxLatencyPictures, const PicturePtr& picture)
+{
+    return (picture->m_output_needed
+        && (picture->m_pic_latency_cnt >= spsMaxLatencyPictures));
+}
+
+bool VaapiDecoderH265::DPB::checkLatencyCnt()
+{
+    PictureList::iterator it =
+        find_if(m_pictures.begin(), m_pictures.end(),
+                bind(checkPictureLatencyCnt, m_spsMaxLatencyPictures, _1));
+    return it != m_pictures.end();
 }
 
 const bool VaapiDecoderH265::s_registered =
